@@ -1,18 +1,10 @@
 # Navio — Agentic Trip Planner
 
-A multi-agent travel-planning app built for *Agentic AI for Analytics*. Three specialized agents — flight search, hotel search, and a RAG-grounded trip planner — exposed through a FastAPI backend and a React frontend (the **Navio** UI). A legacy Streamlit MVP is also kept around for quick CLI-style demos.
-
-| Agent | Pattern | What it does |
-|---|---|---|
-| **Flight Search** | LangGraph StateGraph + MCP tool calling | City/IATA → Google Flights via Bright Data MCP → Gemini extracts a structured ranked list |
-| **Hotel Search** | LangGraph StateGraph + MCP tool calling | City → Google Hotels via Bright Data MCP → Gemini extracts a structured ranked list |
-| **Trip Planner (RAG)** | LangGraph `create_react_agent` + RAG + memory | Itinerary generation + chat refinement, grounded in a ChromaDB index of Wikivoyage articles, with conversation memory via `MemorySaver` |
-
-Class concepts demonstrated end-to-end: **agent framework, tool calling, MCP, hosted models, RAG, memory, multi-agent orchestration.**
+Navio is a multi-agent travel-planning application that combines real-time web scraping with retrieval-augmented generation. Three specialized agents — a flight search agent, a hotel search agent, and a RAG-grounded trip planner — sit behind a FastAPI orchestrator and a React frontend, letting the user describe a trip in natural language and receive curated flight + hotel packages with a day-by-day itinerary tailored to their vibe.
 
 ---
 
-## Architecture overview
+## Architecture
 
 ```
                          ┌──────────────────────────────────────┐
@@ -58,16 +50,143 @@ Class concepts demonstrated end-to-end: **agent framework, tool calling, MCP, ho
               (single npx subprocess, shared singleton)
 ```
 
-### Two search modes
+The React UI talks to a FastAPI backend that orchestrates three agents. Live travel data comes from a Bright Data MCP server (one shared `npx` subprocess), and grounded destination knowledge comes from a ChromaDB index over Wikivoyage articles. Vertex AI Gemini 2.5 Flash drives every reasoning step; Vertex `text-embedding-005` powers the RAG retrieval.
 
-- **Mode A — known destination.** User fills in the destination on the planner. Flight + hotel agents run in parallel for that city → 2 Bright Data scrapes → cross-product all flights × all hotels → return cheapest 3 packages with **nonstop flights preferred** over flights with stops.
-- **Mode B — brainstorm.** User leaves the destination blank and only describes a vibe. The RAG agent runs `find_destinations(vibe)` first to surface 3 candidate cities, then 3× (flight + hotel) scrapes run in parallel → 6 Bright Data scrapes total → return the best package per destination.
+---
 
-### Itinerary + chat flow
+## Pipeline
 
-1. User selects a package → React calls `POST /api/trip/new` to get a fresh `thread_id`, then `POST /api/trip/itinerary` to generate a day-by-day plan via the RAG agent.
-2. The trip planner replies with a structured `## Day 1` / `## Day 2` markdown block which the API parses into `{ days: [{ day, activities[] }] }`.
-3. User refines via the in-page chat (`POST /api/trip/chat`). The chat is **locked to the destination** (the API wraps the user's message with a context guard) and **plain-text only** (no markdown leaks into the UI).
+### Search modes
+
+The `POST /api/search` endpoint in [api/routes/search.py](api/routes/search.py) chooses one of two flows based on the form input.
+
+- **Mode A — known destination.** The user fills in the destination on the planner. The flight and hotel agents run in parallel for that city via `asyncio.gather` (2 Bright Data scrapes total). The orchestrator cross-products every scraped flight against every scraped hotel, sorts with a tiered key (nonstop flights first, then cheapest within tier), and returns the top 3 packages.
+- **Mode B — brainstorm.** The user leaves the destination blank and only describes a vibe. The RAG agent's `find_destinations(vibe)` runs first to surface 3 candidate cities. Then 3 × (flight + hotel) pairs run in parallel (6 Bright Data scrapes total). The orchestrator returns the cheapest nonstop-preferred package per destination.
+
+In both modes the response also includes `allFlights` and `allHotels` — the full scraped lists, tagged by destination, sorted by `(stops, price)` for flights and by price for hotels — which the UI exposes through a "Show all scraped flights and hotels" toggle.
+
+### Itinerary + chat
+
+Once the user selects a package, the React UI calls:
+
+1. `POST /api/trip/new` to mint a fresh `thread_id` (UUID).
+2. `POST /api/trip/itinerary` with the destination, number of days, and the user's original vibe text. The handler in [api/routes/trip.py](api/routes/trip.py) runs **one** RAG retrieval (`get_destination_details(destination, query=vibe, section_types=["See","Do","Eat","Drink"], k=15)`) and **one** Gemini call with `with_structured_output(_ItineraryStructured)`. The response is a list of days with 3–4 specific activities each.
+3. `POST /api/trip/chat` for refinements ("add more beaches on day 3"). Every chat request carries the destination so the chat handler can wrap the user's message with a context guard, keeping the RAG agent locked to the selected city. The reply is post-processed to strip any markdown so the UI can render plain conversational text.
+
+The chat thread is keyed on `thread_id` so consecutive messages share conversation history via LangGraph's `MemorySaver`.
+
+---
+
+## Agent implementations
+
+### Flight Search Agent
+
+A 5-node LangGraph `StateGraph` defined in [agent.py](agent.py).
+
+```
+resolve → build_url → scrape → extract → filter → END
+```
+
+- **`resolve`** — Gemini bound to the `resolve_airport` tool ([tools/airports.py](tools/airports.py)). Converts a city name like `"New York"` to IATA codes (`["JFK","LGA","EWR"]`) using a hardcoded multi-airport metro lookup plus the OpenFlights `airports.csv`.
+- **`build_url`** — Pure Python in [google_flights.py](google_flights.py). Constructs a Google Flights search URL with a natural-language `?q=...` query.
+- **`scrape`** — Calls `scrape_as_markdown` on the shared Bright Data MCP server. Retries once on a sub-5K-char or CAPTCHA response.
+- **`extract`** — Gemini with `with_structured_output(FlightsResponse)` parses the markdown into a list of `FlightOption` objects ([schemas.py](schemas.py)).
+- **`filter`** — Drops zero-priced/zero-duration rows, applies optional airline and max-stops filters, sorts by price, returns the top 10.
+
+Entry point: `async def run_search(form: FormInput) -> FlightsResponse`.
+
+### Hotel Search Agent
+
+A 4-node LangGraph `StateGraph` defined in [hotel_agent/agent.py](hotel_agent/agent.py). No resolve step — hotels are searched by city name directly.
+
+```
+build_url → scrape → extract → filter → END
+```
+
+- **`build_url`** — [hotel_agent/google_hotels.py](hotel_agent/google_hotels.py) builds `https://www.google.com/travel/hotels?q=Hotels in {city} from {checkin} to {checkout}`.
+- **`scrape`** — Reuses the same MCP scrape singleton as the flight agent (one shared subprocess for the whole process). Same retry-once behaviour.
+- **`extract`** — Gemini with `with_structured_output(HotelsResponse)` and a strict prompt ([prompts/hotel_extraction.md](prompts/hotel_extraction.md)) that forbids using any hotel name not present verbatim in the markdown.
+- **`filter`** — Applies optional price-range, rating, and star-class filters; sorts by relevance/price/rating; returns the top results.
+
+Entry point: `async def run_hotel_search(form: HotelFormInput) -> HotelsResponse`.
+
+### Trip Planner (RAG)
+
+The RAG agent has two entry points serving the two patterns the UI needs:
+
+**Itinerary generation (single-shot).** [api/routes/trip.py](api/routes/trip.py)`generate_itinerary` calls `get_destination_details` directly ([trip_planner/retrieval.py](trip_planner/retrieval.py)) — one embedding + one ChromaDB query — then hands the retrieved chunks to Gemini with `with_structured_output(_ItineraryStructured)`. This avoids the variable-latency ReAct loop for a flow where we already know exactly which retrieval we want.
+
+**Chat refinement (ReAct loop with memory).** [trip_planner/agent.py](trip_planner/agent.py) builds a `create_react_agent` over Gemini and exposes two tools from [trip_planner/tools.py](trip_planner/tools.py):
+
+- `search_destinations(query)` — for vibe-style brainstorm queries; also used by the orchestrator's Mode B.
+- `search_destination_content(destination, query, section_types)` — for itinerary-style queries about a known city.
+
+Both tools wrap the retrieval functions in [trip_planner/retrieval.py](trip_planner/retrieval.py). The chat agent uses a `MemorySaver` checkpointer keyed on `thread_id`, so consecutive `/api/trip/chat` calls share conversation history.
+
+The corpus itself is built by [trip_planner/corpus_build.py](trip_planner/corpus_build.py) (fetches Wikivoyage wikitext per city and caches it on disk), [trip_planner/chunking.py](trip_planner/chunking.py) (parses articles with `mwparserfromhell` and splits relevant sections into ~1500-char chunks with 200-char overlap), [trip_planner/embeddings.py](trip_planner/embeddings.py) (Vertex `text-embedding-005`), and [trip_planner/vectorstore.py](trip_planner/vectorstore.py) (ChromaDB with cosine similarity, two collections: `destinations` for vibe matching, `sections` for content lookup).
+
+---
+
+## Class concepts → implementation
+
+| Class concept | Where it lives in Navio | How it's implemented |
+|---|---|---|
+| **Agent framework** | LangGraph throughout | `StateGraph` for the deterministic flight/hotel pipelines ([agent.py](agent.py), [hotel_agent/agent.py](hotel_agent/agent.py)). `create_react_agent` for the conversational RAG agent ([trip_planner/agent.py](trip_planner/agent.py)). Both use the same `langgraph` runtime. |
+| **Tool calling** | LLMs choose and invoke `@tool`-decorated functions | `resolve_airport` in [tools/airports.py](tools/airports.py) is bound to the flight agent's `resolve_node` via `llm.bind_tools(...)`. `search_destinations` and `search_destination_content` in [trip_planner/tools.py](trip_planner/tools.py) are exposed to the chat agent's ReAct loop. The MCP `scrape_as_markdown` tool is invoked from the `scrape_node` of both scraping agents. |
+| **MCP** | Bright Data scrape MCP server | A single `npx @brightdata/mcp` subprocess is launched via `MultiServerMCPClient` in [shared.py](shared.py)`get_scrape_tool()`, communicating over stdio. The returned `scrape_as_markdown` tool is reused by both the flight and hotel `scrape_node`s — one MCP connection serves the whole process. |
+| **RAG** | ChromaDB over Wikivoyage articles | [data/destinations.txt](data/destinations.txt) lists the indexed cities. [trip_planner/corpus_build.py](trip_planner/corpus_build.py) fetches Wikivoyage wikitext, [trip_planner/chunking.py](trip_planner/chunking.py) splits sections, [trip_planner/embeddings.py](trip_planner/embeddings.py) embeds via Vertex, [trip_planner/vectorstore.py](trip_planner/vectorstore.py) persists in ChromaDB (cosine, two collections). [trip_planner/retrieval.py](trip_planner/retrieval.py)`get_destination_details` is the read path used by both the chat agent's `search_destination_content` tool and the single-shot itinerary endpoint. |
+| **Multi-agent orchestration** | FastAPI route runs three agents in coordination | `POST /api/search` in [api/routes/search.py](api/routes/search.py): in Mode A, `asyncio.gather(run_search(flight), run_hotel_search(hotel))` runs the flight and hotel agents concurrently and the orchestrator merges their outputs into packages. In Mode B, the RAG agent's `find_destinations()` runs first to pick 3 cities, then 3 × (flight, hotel) pairs run in parallel. The FastAPI `lifespan` in [api/app.py](api/app.py) warms up every agent at startup so the first request is fast. |
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+ (the Bright Data MCP server runs as an `npx` subprocess; the React frontend uses `npm`)
+- A Bright Data account with an API token
+- A GCP project with Vertex AI enabled, plus `gcloud` Application Default Credentials (`gcloud auth application-default login` and `gcloud services enable aiplatform.googleapis.com`)
+
+### Setup
+
+```bash
+# Python environment
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Environment variables
+cp .env.example .env
+# Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
+
+# OpenFlights airport DB (gitignored)
+mkdir -p data
+curl -L -o data/airports.csv \
+  https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat
+
+# Build the RAG corpus (~5 min, idempotent)
+python scripts/build_corpus.py
+```
+
+### Run
+
+In two terminals:
+
+**Backend:**
+```bash
+source .venv/bin/activate
+python -m uvicorn api.app:app --reload --port 8000
+```
+
+**Frontend:**
+```bash
+cd frontend
+npm install   # first time only
+npm run dev
+```
+
+Open the Vite URL it prints (defaults to `http://localhost:5173`).
 
 ---
 
@@ -75,21 +194,21 @@ Class concepts demonstrated end-to-end: **agent framework, tool calling, MCP, ho
 
 ```
 trip-planner/
-├── README.md                         # ← you are here
+├── README.md
 ├── requirements.txt
 ├── .env.example
 │
 ├── shared.py                         # get_llm, get_scrape_tool, _normalize_mcp_text — shared by both scrape agents
 │
-├── agent.py                          # Flight agent: 5-node StateGraph (resolve→build_url→scrape→extract→filter)
+├── agent.py                          # Flight agent: 5-node StateGraph
 ├── google_flights.py                 # Flight URL builder
 ├── schemas.py                        # FormInput, FlightOption, FlightsResponse
 ├── tools/airports.py                 # @tool resolve_airport + METRO_AIRPORTS
 ├── prompts/system.md                 # Flight resolve_node system prompt
 │
 ├── hotel_agent/
-│   ├── agent.py                      # Hotel agent: 4-node StateGraph (build_url→scrape→extract→filter)
-│   ├── google_hotels.py              # Hotel URL builder (Google Hotels natural-language ?q=)
+│   ├── agent.py                      # Hotel agent: 4-node StateGraph
+│   ├── google_hotels.py              # Hotel URL builder
 │   └── schemas.py                    # HotelFormInput, HotelOption, HotelsResponse
 ├── prompts/hotel_extraction.md       # Hotel extraction prompt
 │
@@ -99,266 +218,40 @@ trip-planner/
 │   ├── chunking.py                   # parse_article, chunk_destination
 │   ├── embeddings.py                 # singleton VertexAIEmbeddings (text-embedding-005)
 │   ├── vectorstore.py                # singleton ChromaDB PersistentClient (cosine)
-│   ├── retrieval.py                  # find_destinations, get_destination_details, fuzzy resolver
-│   ├── tools.py                      # @tool wrappers exposed to the RAG agent
-│   ├── schemas.py                    # DestinationHit, SectionHit, TripPlanResponse
+│   ├── retrieval.py                  # find_destinations, get_destination_details
+│   ├── tools.py                      # @tool wrappers for the chat agent
+│   ├── schemas.py                    # DestinationHit, SectionHit
 │   └── prompts/system.md             # RAG agent system prompt
 │
 ├── api/
-│   ├── app.py                        # FastAPI app + CORS + lifespan warmup (chromadb, agents, MCP)
-│   ├── schemas.py                    # API request/response models (TripSearchRequest, TravelPackage, ...)
+│   ├── app.py                        # FastAPI app + CORS + lifespan warmup
+│   ├── schemas.py                    # API request/response models
 │   └── routes/
-│       ├── search.py                 # POST /api/search — Mode A + Mode B + package pairing + allFlights/allHotels
+│       ├── search.py                 # POST /api/search — Mode A + Mode B
 │       └── trip.py                   # POST /api/trip/{itinerary,chat,new}
 │
 ├── frontend/                         # Navio React UI (Vite + Tailwind)
 │   ├── package.json
 │   └── src/app/
-│       ├── App.tsx                   # Top-level state, fetch() to FastAPI, view router
+│       ├── App.tsx
 │       └── components/
-│           ├── Brand.tsx             # Navio logo + animated palm tree
-│           ├── PlannerSection.tsx    # Initial form
-│           ├── TravelResultCard.tsx  # Package card
-│           ├── FullResults.tsx       # Toggle: full scraped flights/hotels grouped by destination
-│           ├── ItineraryPage.tsx     # Day-by-day itinerary + destination-locked chat
-│           └── Sidebar.tsx           # Sticky search-summary + nav (after first search)
-│
-├── streamlit_app.py                  # Legacy MVP UI (still works)
-├── pages/                            # Streamlit pages (auto-discovered)
-│   ├── 1_✈️_Flight_Search.py
-│   └── 2_🗺️_Trip_Planner.py
-├── async_runner.py                   # Streamlit-only thread-based async runner
+│           ├── Brand.tsx             # Navio logo + animated palm
+│           ├── PlannerSection.tsx
+│           ├── TravelResultCard.tsx
+│           ├── FullResults.tsx
+│           ├── ItineraryPage.tsx
+│           └── Sidebar.tsx
 │
 ├── data/
 │   ├── airports.csv                  # OpenFlights IATA DB (gitignored)
-│   ├── destinations.txt              # Pilot list of cities (tracked)
+│   ├── destinations.txt              # Indexed cities (tracked)
 │   ├── chroma/                       # ChromaDB persistence (gitignored)
 │   └── wikivoyage_cache/             # Raw wikitext per destination (gitignored)
 │
-├── scripts/
-│   ├── test_mcp.py / test_scrape.py / test_embeddings.py / test_chroma.py / test_wikivoyage.py
-│   ├── build_corpus.py               # Ingest pipeline: --limit N, --parse-only, --reembed-all
-│   ├── inspect_corpus.py             # Retrieval REPL
-│   ├── run_agent.py                  # Flight agent CLI smoke test
-│   ├── run_hotel_agent.py            # Hotel agent CLI smoke test
-│   └── run_trip_planner.py           # RAG agent CLI smoke test (3 turns; last tests memory)
-│
-└── tests/
-    ├── test_airports.py
-    ├── test_google_flights_url.py
-    ├── test_google_hotels_url.py
-    ├── test_chunking.py
-    ├── test_extraction.py            # @integration (Vertex)
-    └── test_retrieval.py             # @integration (Vertex + Chroma)
+└── scripts/
+    ├── build_corpus.py               # Ingest pipeline
+    ├── inspect_corpus.py             # Retrieval REPL
+    ├── run_agent.py                  # Flight agent CLI smoke test
+    ├── run_hotel_agent.py            # Hotel agent CLI smoke test
+    └── run_trip_planner.py           # RAG agent CLI smoke test
 ```
-
----
-
-## Prerequisites
-
-- **Python 3.11+** (developed on 3.13)
-- **Node.js 18+** — Bright Data MCP server runs as an `npx` subprocess; the React frontend uses npm
-- **Bright Data account** with a token. Free tier (5,000 requests/month) is enough for development. Both flight and hotel agents share one MCP subprocess, so a single search costs ~2 requests (Mode A) or ~6 requests (Mode B).
-- **GCP project** with Vertex AI enabled
-- **gcloud CLI** with Application Default Credentials: `gcloud auth application-default login` and `gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT`
-
----
-
-## Quick start
-
-```bash
-cd trip-planner
-
-# 1. Python venv + deps (~3 min)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2. Environment
-cp .env.example .env
-# Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
-
-# 3. OpenFlights airport DB (~1 MB, gitignored)
-mkdir -p data
-curl -L -o data/airports.csv \
-  https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat
-
-# 4. Phase 0 sanity checks
-python scripts/test_mcp.py          # MCP tools list — must include scrape_as_markdown
-python scripts/test_embeddings.py   # Vertex embed: 768-dim vector
-python scripts/test_chroma.py       # Chroma round-trip
-python scripts/test_wikivoyage.py   # Lisbon article: ≥6 sections
-
-# 5. RAG corpus — ingest the pilot destinations (~5 min, idempotent)
-python scripts/build_corpus.py
-```
-
-### Run the full app (FastAPI + React)
-
-Open two terminals.
-
-**Terminal 1 — backend:**
-```bash
-cd trip-planner
-source .venv/bin/activate
-python -m uvicorn api.app:app --reload --port 8000
-```
-
-You should see:
-```
-[api] chromadb + trip planner agent warmed up
-[api] MCP subprocess + flight/hotel agents warmed up
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8000
-```
-
-**Terminal 2 — frontend:**
-```bash
-cd trip-planner/frontend
-npm install   # first time only
-npm run dev
-```
-
-Open the Vite URL it prints (usually `http://localhost:5173`). The CORS config in `api/app.py` already allows `localhost:5173` and `localhost:3000`.
-
-### Or run the legacy Streamlit MVP
-
-```bash
-streamlit run streamlit_app.py
-```
-
----
-
-## API reference
-
-### `POST /api/search` — combined flight + hotel search
-
-```json
-// Request — Mode A (known destination)
-{
-  "departure": "New York",
-  "destination": "Lisbon",
-  "startDate": "2026-07-01",
-  "endDate": "2026-07-08",
-  "travelerCount": 2,
-  "chatMessage": "summer trip with sightseeing and nightlife"
-}
-
-// Request — Mode B (brainstorm: leave destination blank)
-{
-  "departure": "New York",
-  "destination": "",
-  "startDate": "2026-07-01",
-  "endDate": "2026-07-08",
-  "travelerCount": 2,
-  "chatMessage": "relaxed beach vacation in Southeast Asia"
-}
-
-// Response
-{
-  "packages": [
-    {
-      "destination": "Lisbon",
-      "flightInfo": { "airline": "TAP", "departure": "JFK", "arrival": "LIS", "duration": "8h 5m", "price": 612, "stops": 0 },
-      "hotelInfo": { "name": "Hotel ...", "rating": 4.4, "location": "Baixa", "amenities": ["WiFi","Breakfast"], "pricePerNight": 110 },
-      "totalPrice": 1382
-    }
-  ],
-  "allFlights": [],
-  "allHotels":  [],
-  "notes": "Found 7 flights and 10 hotels for Lisbon."
-}
-```
-
-Packages are picked with a **tiered preference**: nonstop flights first (cheapest within tier), only falling through to 1-stop / 2-stop options if no nonstops exist. The `allFlights` / `allHotels` lists hold every scraped option (sorted, tagged with destination) so the UI's "Show all scraped flights and hotels" toggle can render them grouped.
-
-### `POST /api/trip/new` — start a new chat thread
-
-Returns `{ "thread_id": "<uuid>" }`. The frontend persists this for the duration of the itinerary view and sends it with every chat / itinerary request.
-
-### `POST /api/trip/itinerary` — generate the day-by-day plan
-
-```json
-{
-  "destination": "Lisbon",
-  "num_days": 5,
-  "vibe": "summer trip with sightseeing and nightlife",
-  "thread_id": "<uuid>"
-}
-
-// Response
-{
-  "days": [
-    { "day": 1, "activities": ["Visit Castelo de São Jorge", "..."] },
-    { "day": 2, "activities": [] }
-  ],
-  "thread_id": "<uuid>"
-}
-```
-
-### `POST /api/trip/chat` — refine the itinerary
-
-```json
-{
-  "message": "Can you add more beach time on day 3?",
-  "thread_id": "<uuid>",
-  "destination": "Lisbon"
-}
-
-// Response
-{
-  "reply": "Plain-text reply, 2-4 sentences, no markdown.",
-  "thread_id": "<uuid>",
-  "updated_itinerary": null
-}
-```
-
-The chat handler **wraps the user's message with a destination guard** so the RAG agent stays focused on the selected city (no drifting into other cities), and **strips any markdown** that leaks through into the reply.
-
----
-
-## Testing
-
-```bash
-# Fast unit tests only (~3s)
-pytest -m "not integration"
-
-# Everything, including Vertex- and Chroma-touching tests (~4 min)
-pytest
-
-# Just one file
-pytest tests/test_chunking.py -v
-
-# CLI smoke tests
-python scripts/run_agent.py            # Flight agent
-python scripts/run_hotel_agent.py      # Hotel agent
-python scripts/run_trip_planner.py     # RAG agent (3 turns)
-```
-
----
-
-## Roadmap
-
-1. **Scale the corpus** from ~30 to ~300 destinations. `build_corpus.py` is idempotent — only embeds new chunks.
-2. **Streaming responses** in the chat (`agent.astream_events` instead of `ainvoke`).
-3. **Persistent chat memory** — swap `MemorySaver` for `SqliteSaver` so chat history survives FastAPI restarts.
-4. **Migrate `ChatVertexAI` → `ChatGoogleGenerativeAI`** (deprecated, currently emits warnings).
-5. **Hotel agent improvements** — pull amenities and exact rating from a dedicated Bright Data Web Data API endpoint instead of scrape-and-extract, once the customer's account is activated.
-6. **Multi-agent orchestrator** — top-level agent that does intent classification (search vs. chat vs. brainstorm) and routes to the appropriate sub-agent. Currently this routing lives in the FastAPI route handlers.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `Could not connect to tenant default_tenant` | ChromaDB connection wasn't established before a concurrent request hit the agent. | Already fixed — `lifespan()` in `api/app.py` warms up ChromaDB and the trip planner agent before the MCP subprocess. Restart uvicorn (lifespan only runs on full boot, not on `--reload`). |
-| Hotel scrape returns 31 chars / "Possible CAPTCHA" | The path-based `/travel/hotels/{city}` URL returns a stub. | Already fixed — `build_google_hotels_url` uses the natural-language `?q=Hotels in {city} from {date} to {date}` form, mirroring Google Flights. |
-| Hotels show up as US chains for a Lisbon search | Gemini hallucinating from generic prompt. | Already fixed — `prompts/hotel_extraction.md` strictly forbids using anything not verbatim in the markdown and drops obviously-wrong city names. |
-| Frontend shows wrong destination on itinerary page | `selectedPackage.hotelInfo.location` is the neighborhood, not the city. | Already fixed — packages carry an explicit `destination` field stamped by the API. |
-| Chat replies with bullet points / `**bold**` / headings | RAG agent's default style is markdown. | Already fixed — `/api/trip/chat` wraps the user message with a plain-text style instruction and strips residual markdown server-side before responding. |
-| Chat drifts to other cities | Agent's MemorySaver retains broad context. | Already fixed — chat handler injects `[Context: stay focused on {destination}]` into every user turn, and the frontend sends `destination` with each message. |
-| `npx @brightdata/mcp` hangs on first call | First-run package download. | Pre-install: `npm install -g @brightdata/mcp`. |
-| Trip Planner replies "I don't have information about X" | Destination isn't in the corpus. | Add it to `data/destinations.txt` and re-run `python scripts/build_corpus.py` (idempotent). |
-| `aiplatform.googleapis.com` 403 | API not enabled on the GCP project. | `gcloud services enable aiplatform.googleapis.com --project=$GCP_PROJECT_ID` |
-| `data/airports.csv` not found in worktree | Working in a git worktree where the gitignored data dir wasn't copied. | Symlink: `ln -s ../../../data/airports.csv data/airports.csv` (and similarly for `data/chroma`, `data/wikivoyage_cache`). |

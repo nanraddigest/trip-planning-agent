@@ -36,11 +36,6 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
 
-# OpenFlights airport DB (gitignored)
-mkdir -p data
-curl -L -o data/airports.csv \
-  https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat
-
 # Build the RAG corpus (~5 min, idempotent)
 python scripts/build_corpus.py
 ```

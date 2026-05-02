@@ -8,3 +8,4 @@ data/wikivoyage_cache/
 scripts/sample_markdown.md
 .pytest_cache/
 .DS_Store
+.claude/

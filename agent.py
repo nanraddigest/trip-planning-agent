@@ -1,82 +1,21 @@
 """Flight search agent: LangGraph topology + Bright Data MCP + Vertex AI Gemini."""
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import re
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import TypedDict
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_vertexai import ChatVertexAI
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, StateGraph
 
 from google_flights import build_google_flights_url
 from schemas import FlightOption, FlightsResponse, FormInput
+from shared import _normalize_mcp_text, get_llm, get_scrape_tool
 from tools.airports import resolve_airport
 
-load_dotenv()
-
 PROMPT_DIR = Path(__file__).parent / "prompts"
-
-
-# ---------------------------------------------------------------------------
-# Shared utilities
-# ---------------------------------------------------------------------------
-
-def get_llm(temperature: float = 0) -> ChatVertexAI:
-    return ChatVertexAI(
-        model_name=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-        project=os.environ["GCP_PROJECT_ID"],
-        location=os.environ.get("GCP_REGION", "us-central1"),
-        temperature=temperature,
-    )
-
-
-def _normalize_mcp_text(result) -> str:
-    """Coerce an MCP tool result into a single string.
-
-    langchain-mcp-adapters >= 0.2 may return either a str or a list of MCP
-    content blocks (dicts with 'text', or objects with a .text attribute).
-    """
-    if isinstance(result, str):
-        return result
-    if isinstance(result, list):
-        parts = []
-        for block in result:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict):
-                parts.append(block.get("text", ""))
-            else:
-                parts.append(getattr(block, "text", "") or str(block))
-        return "\n".join(p for p in parts if p)
-    return str(result)
-
-
-# ---------------------------------------------------------------------------
-# MCP client (process-singleton)
-# ---------------------------------------------------------------------------
-
-_scrape_tool = None
-
-
-async def get_scrape_tool():
-    global _scrape_tool
-    if _scrape_tool is None:
-        client = MultiServerMCPClient({
-            "brightdata": {
-                "command": "npx",
-                "args": ["@brightdata/mcp"],
-                "transport": "stdio",
-                "env": {"API_TOKEN": os.environ["BRIGHTDATA_API_TOKEN"]},
-            }
-        })
-        tools = await client.get_tools()
-        _scrape_tool = next(t for t in tools if t.name == "scrape_as_markdown")
-    return _scrape_tool
 
 
 # ---------------------------------------------------------------------------
@@ -222,19 +161,25 @@ def build_url_node(state: AgentState) -> dict:
 
 async def scrape_node(state: AgentState) -> dict:
     scrape = await get_scrape_tool()
-    raw = await scrape.ainvoke({"url": state["url"]})
-    markdown = _normalize_mcp_text(raw)
-    _log_tool_call(
-        "scrape_as_markdown",
-        {"url": state["url"]},
-        f"{len(markdown)} chars",
-    )
-    if len(markdown) < 5_000 or "verify you are human" in markdown.lower():
-        raise ValueError(
-            f"scrape_node: scrape returned suspiciously little content "
-            f"({len(markdown)} chars). Possible CAPTCHA. Try again."
+    last_len = 0
+    for attempt in (1, 2):
+        raw = await scrape.ainvoke({"url": state["url"]})
+        markdown = _normalize_mcp_text(raw)
+        _log_tool_call(
+            "scrape_as_markdown",
+            {"url": state["url"], "attempt": attempt},
+            f"{len(markdown)} chars",
         )
-    return {"markdown": markdown}
+        last_len = len(markdown)
+        if len(markdown) >= 5_000 and "verify you are human" not in markdown.lower():
+            return {"markdown": markdown}
+        if attempt == 1:
+            print(f"[scrape] flake on attempt 1 ({last_len} chars), retrying in 1.5s...")
+            await asyncio.sleep(1.5)
+    raise ValueError(
+        f"scrape_node: scrape returned suspiciously little content after 2 "
+        f"attempts (last={last_len} chars). Possible CAPTCHA."
+    )
 
 
 async def extract_node(state: AgentState) -> dict:

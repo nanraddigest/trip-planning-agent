@@ -4,6 +4,69 @@ Navio is a multi-agent travel-planning application that combines real-time web s
 
 ---
 
+## Class concepts → implementation
+
+| Class concept | Where it lives in Navio | How it's implemented |
+|---|---|---|
+| **Agent framework** | LangGraph throughout | `StateGraph` for the deterministic flight/hotel pipelines ([agent.py](agent.py), [hotel_agent/agent.py](hotel_agent/agent.py)). `create_react_agent` for the conversational RAG agent ([trip_planner/agent.py](trip_planner/agent.py)). Both use the same `langgraph` runtime. |
+| **Tool calling** | LLMs choose and invoke `@tool`-decorated functions | `resolve_airport` in [tools/airports.py](tools/airports.py) is bound to the flight agent's `resolve_node` via `llm.bind_tools(...)`. `search_destinations` and `search_destination_content` in [trip_planner/tools.py](trip_planner/tools.py) are exposed to the chat agent's ReAct loop. The MCP `scrape_as_markdown` tool is invoked from the `scrape_node` of both scraping agents. |
+| **MCP** | Bright Data scrape MCP server | A single `npx @brightdata/mcp` subprocess is launched via `MultiServerMCPClient` in [shared.py](shared.py)`get_scrape_tool()`, communicating over stdio. The returned `scrape_as_markdown` tool is reused by both the flight and hotel `scrape_node`s — one MCP connection serves the whole process. |
+| **RAG** | ChromaDB over Wikivoyage articles | [data/destinations.txt](data/destinations.txt) lists the indexed cities. [trip_planner/corpus_build.py](trip_planner/corpus_build.py) fetches Wikivoyage wikitext, [trip_planner/chunking.py](trip_planner/chunking.py) splits sections, [trip_planner/embeddings.py](trip_planner/embeddings.py) embeds via Vertex, [trip_planner/vectorstore.py](trip_planner/vectorstore.py) persists in ChromaDB (cosine, two collections). [trip_planner/retrieval.py](trip_planner/retrieval.py)`get_destination_details` is the read path used by both the chat agent's `search_destination_content` tool and the single-shot itinerary endpoint. |
+| **Multi-agent orchestration** | FastAPI route runs three agents in coordination | `POST /api/search` in [api/routes/search.py](api/routes/search.py): in Mode A, `asyncio.gather(run_search(flight), run_hotel_search(hotel))` runs the flight and hotel agents concurrently and the orchestrator merges their outputs into packages. In Mode B, the RAG agent's `find_destinations()` runs first to pick 3 cities, then 3 × (flight, hotel) pairs run in parallel. The FastAPI `lifespan` in [a
+---
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+ (the Bright Data MCP server runs as an `npx` subprocess; the React frontend uses `npm`)
+- A Bright Data account with an API token
+- A GCP project with Vertex AI enabled, plus `gcloud` Application Default Credentials (`gcloud auth application-default login` and `gcloud services enable aiplatform.googleapis.com`)
+
+### Setup
+
+```bash
+# Python environment
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Environment variables
+cp .env.example .env
+# Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
+
+# OpenFlights airport DB (gitignored)
+mkdir -p data
+curl -L -o data/airports.csv \
+  https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat
+
+# Build the RAG corpus (~5 min, idempotent)
+python scripts/build_corpus.py
+```
+
+### Run
+
+In two terminals:
+
+**Backend:**
+```bash
+source .venv/bin/activate
+python -m uvicorn api.app:app --reload --port 8000
+```
+
+**Frontend:**
+```bash
+cd frontend
+npm install   # first time only
+npm run dev
+```
+
+Open the Vite URL it prints (defaults to `http://localhost:5173`).
+
+---
+
+
 ## Architecture
 
 ```
@@ -125,68 +188,8 @@ Both tools wrap the retrieval functions in [trip_planner/retrieval.py](trip_plan
 
 The corpus itself is built by [trip_planner/corpus_build.py](trip_planner/corpus_build.py) (fetches Wikivoyage wikitext per city and caches it on disk), [trip_planner/chunking.py](trip_planner/chunking.py) (parses articles with `mwparserfromhell` and splits relevant sections into ~1500-char chunks with 200-char overlap), [trip_planner/embeddings.py](trip_planner/embeddings.py) (Vertex `text-embedding-005`), and [trip_planner/vectorstore.py](trip_planner/vectorstore.py) (ChromaDB with cosine similarity, two collections: `destinations` for vibe matching, `sections` for content lookup).
 
----
+pi/app.py](api/app.py) warms up every agent at startup so the first request is fast. |
 
-## Class concepts → implementation
-
-| Class concept | Where it lives in Navio | How it's implemented |
-|---|---|---|
-| **Agent framework** | LangGraph throughout | `StateGraph` for the deterministic flight/hotel pipelines ([agent.py](agent.py), [hotel_agent/agent.py](hotel_agent/agent.py)). `create_react_agent` for the conversational RAG agent ([trip_planner/agent.py](trip_planner/agent.py)). Both use the same `langgraph` runtime. |
-| **Tool calling** | LLMs choose and invoke `@tool`-decorated functions | `resolve_airport` in [tools/airports.py](tools/airports.py) is bound to the flight agent's `resolve_node` via `llm.bind_tools(...)`. `search_destinations` and `search_destination_content` in [trip_planner/tools.py](trip_planner/tools.py) are exposed to the chat agent's ReAct loop. The MCP `scrape_as_markdown` tool is invoked from the `scrape_node` of both scraping agents. |
-| **MCP** | Bright Data scrape MCP server | A single `npx @brightdata/mcp` subprocess is launched via `MultiServerMCPClient` in [shared.py](shared.py)`get_scrape_tool()`, communicating over stdio. The returned `scrape_as_markdown` tool is reused by both the flight and hotel `scrape_node`s — one MCP connection serves the whole process. |
-| **RAG** | ChromaDB over Wikivoyage articles | [data/destinations.txt](data/destinations.txt) lists the indexed cities. [trip_planner/corpus_build.py](trip_planner/corpus_build.py) fetches Wikivoyage wikitext, [trip_planner/chunking.py](trip_planner/chunking.py) splits sections, [trip_planner/embeddings.py](trip_planner/embeddings.py) embeds via Vertex, [trip_planner/vectorstore.py](trip_planner/vectorstore.py) persists in ChromaDB (cosine, two collections). [trip_planner/retrieval.py](trip_planner/retrieval.py)`get_destination_details` is the read path used by both the chat agent's `search_destination_content` tool and the single-shot itinerary endpoint. |
-| **Multi-agent orchestration** | FastAPI route runs three agents in coordination | `POST /api/search` in [api/routes/search.py](api/routes/search.py): in Mode A, `asyncio.gather(run_search(flight), run_hotel_search(hotel))` runs the flight and hotel agents concurrently and the orchestrator merges their outputs into packages. In Mode B, the RAG agent's `find_destinations()` runs first to pick 3 cities, then 3 × (flight, hotel) pairs run in parallel. The FastAPI `lifespan` in [api/app.py](api/app.py) warms up every agent at startup so the first request is fast. |
-
----
-
-## Quick start
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+ (the Bright Data MCP server runs as an `npx` subprocess; the React frontend uses `npm`)
-- A Bright Data account with an API token
-- A GCP project with Vertex AI enabled, plus `gcloud` Application Default Credentials (`gcloud auth application-default login` and `gcloud services enable aiplatform.googleapis.com`)
-
-### Setup
-
-```bash
-# Python environment
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Environment variables
-cp .env.example .env
-# Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
-
-# OpenFlights airport DB (gitignored)
-mkdir -p data
-curl -L -o data/airports.csv \
-  https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat
-
-# Build the RAG corpus (~5 min, idempotent)
-python scripts/build_corpus.py
-```
-
-### Run
-
-In two terminals:
-
-**Backend:**
-```bash
-source .venv/bin/activate
-python -m uvicorn api.app:app --reload --port 8000
-```
-
-**Frontend:**
-```bash
-cd frontend
-npm install   # first time only
-npm run dev
-```
-
-Open the Vite URL it prints (defaults to `http://localhost:5173`).
 
 ---
 

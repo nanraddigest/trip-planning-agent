@@ -33,8 +33,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Environment variables
-cp .env.example .env
-# Edit .env: BRIGHTDATA_API_TOKEN, GCP_PROJECT_ID, GCP_REGION, GEMINI_MODEL
+Create a .env file with: 
+BRIGHTDATA_API_TOKEN = <user insert>
+GCP_PROJECT_ID = <user insert>
+GCP_REGION = <user insert> #us-central1
+GEMINI_MODEL = <user insert> #gemini-2.5-flash
 
 # Build the RAG corpus (~5 min, idempotent)
 python scripts/build_corpus.py

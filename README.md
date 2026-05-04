@@ -49,8 +49,7 @@ In two terminals:
 
 **Backend:**
 ```bash
-source .venv/bin/activate
-python -m uvicorn api.app:app --reload --port 8000
+uv run uvicorn api.app:app --reload --port 8000
 ```
 
 **Frontend:**

@@ -14,8 +14,8 @@ steps:
       - '--region=us-central1'
       - '--allow-unauthenticated'
       - '--port=8080'
+      - '--clear-secrets'
       - '--set-env-vars=GCP_PROJECT_ID=third-camera-487000-k9,GCP_REGION=us-central1,GEMINI_MODEL=gemini-2.5-flash'
-      - '--update-secrets=BRIGHTDATA_API_TOKEN=brightdata-token:latest'
 
 options:
   logging: CLOUD_LOGGING_ONLY

@@ -1,3 +1,35 @@
+[project]
+name = "navio"
+version = "0.1.0"
+description = "Multi-agent travel-planning app: flight + hotel scraping (Bright Data MCP) and a RAG trip planner over Wikivoyage."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-mcp-adapters>=0.1",
+    "langchain-core>=0.3",
+    "langgraph>=0.2",
+    "langchain-google-vertexai>=2.0",
+    "google-cloud-aiplatform>=1.70",
+    "mcp>=1.0",
+    "python-dotenv>=1.0",
+    "pandas>=2.2",
+    "pydantic>=2.0",
+    "streamlit>=1.40",
+    "chromadb>=0.5",
+    "mwparserfromhell>=0.6",
+    "tqdm>=4.66",
+    "rapidfuzz>=3.6",
+    "requests>=2.31",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that hit external APIs (Vertex AI, Bright Data, Wikivoyage)",

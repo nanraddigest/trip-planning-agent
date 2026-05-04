@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 
-const API_BASE = "http://localhost:8000";
+// In production (single-service Cloud Run deploy) the frontend and API share
+// an origin, so use relative URLs. In dev (Vite on :5173, uvicorn on :8000)
+// fall back to the explicit localhost backend.
+const API_BASE = import.meta.env.PROD ? "" : "http://localhost:8000";
 
 interface ItineraryDay {
   day: number;

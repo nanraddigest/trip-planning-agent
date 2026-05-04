@@ -6,7 +6,10 @@ import { ItineraryPage } from './components/ItineraryPage';
 import { FullResults } from './components/FullResults';
 import { Brand } from './components/Brand';
 
-const API_BASE = "http://localhost:8000";
+// In production (single-service Cloud Run deploy) the frontend and API share
+// an origin, so use relative URLs. In dev (Vite on :5173, uvicorn on :8000)
+// fall back to the explicit localhost backend.
+const API_BASE = import.meta.env.PROD ? "" : "http://localhost:8000";
 
 export default function App() {
   const [searchResults, setSearchResults] = useState<any[]>([]);

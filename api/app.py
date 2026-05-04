@@ -7,8 +7,12 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 @asynccontextmanager
@@ -56,3 +60,32 @@ app.include_router(trip.router, prefix="/api/trip", tags=["trip-planner"])
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (production single-service deploy)
+# ---------------------------------------------------------------------------
+# Mounted AFTER the /api routers so API routes still take precedence. The
+# guard means local dev (no `npm run build` yet) skips this entirely and the
+# Vite dev server on :5173 talks to the API on :8000 via CORS instead.
+if FRONTEND_DIST.exists():
+    assets_dir = FRONTEND_DIST / "assets"
+    if assets_dir.exists():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=assets_dir),
+            name="assets",
+        )
+
+    @app.get("/")
+    async def index():
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get("/{path:path}")
+    async def spa_fallback(path: str):
+        # API routes are already registered above; this only fires for SPA
+        # client-side routes and static files like favicon.ico.
+        candidate = FRONTEND_DIST / path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")

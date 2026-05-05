@@ -2,6 +2,7 @@
 
 Navio is a multi-agent travel-planning application that combines real-time web scraping with retrieval-augmented generation. Three specialized agents — a flight search agent, a hotel search agent, and a RAG-grounded trip planner — sit behind a FastAPI orchestrator and a React frontend, letting the user describe a trip in natural language and receive curated flight + hotel packages with a day-by-day itinerary tailored to their vibe.
 
+
 ---
 
 ## Class concepts → implementation
@@ -12,9 +13,16 @@ Navio is a multi-agent travel-planning application that combines real-time web s
 | **Tool calling** | LLMs choose and invoke `@tool`-decorated functions | `resolve_airport` in [tools/airports.py](tools/airports.py) is bound to the flight agent's `resolve_node` via `llm.bind_tools(...)`. `search_destinations` and `search_destination_content` in [trip_planner/tools.py](trip_planner/tools.py) are exposed to the chat agent's ReAct loop. The MCP `scrape_as_markdown` tool is invoked from the `scrape_node` of both scraping agents. |
 | **MCP** | Bright Data scrape MCP server | A single `npx @brightdata/mcp` subprocess is launched via `MultiServerMCPClient` in [shared.py](shared.py)`get_scrape_tool()`, communicating over stdio. The returned `scrape_as_markdown` tool is reused by both the flight and hotel `scrape_node`s — one MCP connection serves the whole process. |
 | **RAG** | ChromaDB over Wikivoyage articles | [data/destinations.txt](data/destinations.txt) lists the indexed cities. [trip_planner/corpus_build.py](trip_planner/corpus_build.py) fetches Wikivoyage wikitext, [trip_planner/chunking.py](trip_planner/chunking.py) splits sections, [trip_planner/embeddings.py](trip_planner/embeddings.py) embeds via Vertex, [trip_planner/vectorstore.py](trip_planner/vectorstore.py) persists in ChromaDB (cosine, two collections). [trip_planner/retrieval.py](trip_planner/retrieval.py)`get_destination_details` is the read path used by both the chat agent's `search_destination_content` tool and the single-shot itinerary endpoint. |
-| **Multi-agent orchestration** | FastAPI route runs three agents in coordination | `POST /api/search` in [api/routes/search.py](api/routes/search.py): in Mode A, `asyncio.gather(run_search(flight), run_hotel_search(hotel))` runs the flight and hotel agents concurrently and the orchestrator merges their outputs into packages. In Mode B, the RAG agent's `find_destinations()` runs first to pick 3 cities, then 3 × (flight, hotel) pairs run in parallel. The FastAPI `lifespan` in [a
+| **Multi-agent orchestration** | FastAPI route runs three agents in coordination | `POST /api/search` in [api/routes/search.py](api/routes/search.py): in Mode A, `asyncio.gather(run_search(flight), run_hotel_search(hotel))` runs the flight and hotel agents concurrently and the orchestrator merges their outputs into packages. In Mode B, the RAG agent's `find_destinations()` runs first to pick 3 cities, then (flight, hotel) pairs run in parallel.
+
 ---
 
+## Disclaimers
+
+* For speed, the RAG agent's corpus only includes top 30 destinations, so the agent does not support all travel destinations in the world. Please refer to data/destinations.txt
+* The BRIGHTDATA API token used to scrape the hotels and flights will expire this week (5/11/26). 
+
+--
 ## Quick start
 
 ### Prerequisites
@@ -243,10 +251,10 @@ trip-planner/
 │           └── Sidebar.tsx
 │
 ├── data/
-│   ├── airports.csv                  # OpenFlights IATA DB (gitignored)
-│   ├── destinations.txt              # Indexed cities (tracked)
-│   ├── chroma/                       # ChromaDB persistence (gitignored)
-│   └── wikivoyage_cache/             # Raw wikitext per destination (gitignored)
+│   ├── airports.csv                  # OpenFlights IATA DB 
+│   ├── destinations.txt              # Indexed cities 
+│   ├── chroma/                       # ChromaDB persistence 
+│   └── wikivoyage_cache/             # Raw wikitext per destination 
 │
 └── scripts/
     ├── build_corpus.py               # Ingest pipeline

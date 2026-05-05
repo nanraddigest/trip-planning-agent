@@ -14,8 +14,10 @@ steps:
       - '--region=us-central1'
       - '--allow-unauthenticated'
       - '--port=8080'
+      - '--memory=2Gi'
+      - '--cpu=1'
       - '--clear-secrets'
-      - '--set-env-vars=GCP_PROJECT_ID=third-camera-487000-k9,GCP_REGION=us-central1,GEMINI_MODEL=gemini-2.5-flash'
+      - '--update-env-vars=GCP_PROJECT_ID=third-camera-487000-k9,GCP_REGION=us-central1,GEMINI_MODEL=gemini-2.5-flash'
 
 options:
   logging: CLOUD_LOGGING_ONLY

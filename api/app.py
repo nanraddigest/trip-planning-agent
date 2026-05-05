@@ -1,6 +1,7 @@
 """FastAPI application — bridges the Python agent backend to the React frontend."""
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,9 +18,6 @@ FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from shared import get_scrape_tool
-    from agent import get_agent
-    from hotel_agent.agent import get_hotel_agent
     from trip_planner.retrieval import _all_destination_names
     from api.routes.trip import _get_agent as _get_trip_agent
 
@@ -29,10 +27,27 @@ async def lifespan(app: FastAPI):
     _get_trip_agent()
     print("[api] chromadb + trip planner agent warmed up")
 
-    await get_scrape_tool()
-    get_agent()
-    get_hotel_agent()
-    print("[api] MCP subprocess + flight/hotel agents warmed up")
+    # MCP / flight / hotel warmup is gated on BRIGHTDATA_API_TOKEN so the
+    # container can still boot (and serve /api/trip/*, /api/health) when the
+    # token isn't set yet — e.g. the very first Cloud Run deploy before the
+    # operator adds the secret in the console. /api/search will fail with a
+    # clear error until the token is set, but the rest of the app is fine.
+    if os.environ.get("BRIGHTDATA_API_TOKEN"):
+        from shared import get_scrape_tool
+        from agent import get_agent
+        from hotel_agent.agent import get_hotel_agent
+        try:
+            await get_scrape_tool()
+            get_agent()
+            get_hotel_agent()
+            print("[api] MCP subprocess + flight/hotel agents warmed up")
+        except Exception as e:  # noqa: BLE001
+            print(f"[api] MCP warmup failed (non-fatal): {e}")
+    else:
+        print(
+            "[api] BRIGHTDATA_API_TOKEN is not set — skipping MCP warmup. "
+            "/api/search will fail until the env var is provided."
+        )
     yield
 
 

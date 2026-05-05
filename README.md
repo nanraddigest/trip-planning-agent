@@ -1,7 +1,8 @@
 # Navio — Agentic Trip Planner
 
-Navio is a multi-agent travel-planning application that combines real-time web scraping with retrieval-augmented generation. Three specialized agents — a flight search agent, a hotel search agent, and a RAG-grounded trip planner — sit behind a FastAPI orchestrator and a React frontend, letting the user describe a trip in natural language and receive curated flight + hotel packages with a day-by-day itinerary tailored to their vibe.
+Live URL: https://navio-962383938047.us-central1.run.app
 
+Navio is a multi-agent travel-planning application that combines real-time web scraping with retrieval-augmented generation. Three specialized agents — a flight search agent, a hotel search agent, and a RAG-grounded trip planner — sit behind a FastAPI orchestrator and a React frontend, letting the user describe a trip in natural language and receive curated flight + hotel packages with a day-by-day itinerary tailored to their vibe.
 
 ---
 
@@ -22,7 +23,7 @@ Navio is a multi-agent travel-planning application that combines real-time web s
 * For speed, the RAG agent's corpus only includes top 30 destinations, so the agent does not support all travel destinations in the world. Please refer to data/destinations.txt
 * The BRIGHTDATA API token used to scrape the hotels and flights will expire this week (5/11/26). 
 
---
+---
 ## Quick start
 
 ### Prerequisites

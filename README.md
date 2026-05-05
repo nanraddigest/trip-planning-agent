@@ -35,11 +35,9 @@ Navio is a multi-agent travel-planning application that combines real-time web s
 
 ### Setup
 
+In the project directory run:
+
 ```bash
-# Python environment
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 
 # Environment variables
 Create a .env file with: 
@@ -47,9 +45,6 @@ BRIGHTDATA_API_TOKEN = <user insert>
 GCP_PROJECT_ID = <user insert>
 GCP_REGION = <user insert> #us-central1
 GEMINI_MODEL = <user insert> #gemini-2.5-flash
-
-# Build the RAG corpus (~5 min, idempotent)
-python scripts/build_corpus.py
 ```
 
 ### Run
